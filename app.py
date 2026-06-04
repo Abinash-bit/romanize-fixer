@@ -24,7 +24,10 @@ def load_dictionary(file_bytes: bytes) -> dict:
                 continue
             if ai_word.lower() in ("ai version", "ai_version"):
                 continue
-            replacements[ai_word.lower()] = pr_word
+            for variant in ai_word.split('/'):
+                variant = variant.strip()
+                if variant:
+                    replacements[variant.lower()] = pr_word
     return replacements
 
 
