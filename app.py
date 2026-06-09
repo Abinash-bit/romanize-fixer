@@ -2,18 +2,59 @@ import streamlit as st
 import re
 import copy
 import io
+import time
+import logging
 from docx import Document
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from collections import Counter
 
-# ─────────────────────────────────────────────
-# Core logic
-# ─────────────────────────────────────────────
+from suggest import SuggestEngine
 
-def load_dictionary(file_bytes: bytes) -> dict:
+# ─────────────────────────────────────────────
+# Logging — shows in the terminal where you ran `streamlit run app.py`
+# ─────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-5s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("romanize.app")
+
+# ─────────────────────────────────────────────
+# Tier styling
+# ─────────────────────────────────────────────
+# exact   : confirmed dictionary correction        -> yellow highlight
+# fix     : engine fix, higher confidence (review) -> green  highlight
+# suggest : engine guess, lower confidence (review)-> cyan   highlight
+TIER_HL = {"exact": "yellow", "fix": "green", "suggest": "cyan"}
+
+FIX_CUTOFF = 0.75       # >= this -> "fix" tier (green). below -> "suggest"
+SUGGEST_FLOOR = 0.60    # below this -> ignore entirely (the 0.50-0.60 band was
+                        # ~50% accurate — a coin flip — so we don't show it)
+
+
+# ─────────────────────────────────────────────
+# Dictionary loading
+# ─────────────────────────────────────────────
+def _clean_note(s: str) -> str:
+    """Strip human annotation notes like [accent] / (as per dialogue)."""
+    s = re.sub(r"\[[^\]]*\]", "", s)
+    s = re.sub(r"\([^)]*\)", "", s)
+    return s.strip()
+
+
+def load_dictionary(file_bytes: bytes):
+    """Return (exact_replacements, pairs).
+
+    exact_replacements: {variant_lower: planetread_word}  (verbatim, as before)
+    pairs:              [(wrong, right), ...]  cleaned, for the learning engine
+    """
+    t0 = time.perf_counter()
+    log.info("Loading dictionary (%d KB)…", len(file_bytes) // 1024)
     doc = Document(io.BytesIO(file_bytes))
     replacements = {}
+    pairs = []
     for table in doc.tables:
         for row in table.rows:
             cells = [c.text.strip() for c in row.cells]
@@ -28,9 +69,17 @@ def load_dictionary(file_bytes: bytes) -> dict:
                 variant = variant.strip()
                 if variant:
                     replacements[variant.lower()] = pr_word
-    return replacements
+            a, b = _clean_note(ai_word), _clean_note(pr_word)
+            if a and b:
+                pairs.append((a, b))
+    log.info("Dictionary loaded: %d exact variants, %d clean pairs in %.2fs",
+             len(replacements), len(pairs), time.perf_counter() - t0)
+    return replacements, pairs
 
 
+# ─────────────────────────────────────────────
+# Run XML builders
+# ─────────────────────────────────────────────
 def _base_rPr(source_run_xml=None):
     if source_run_xml is not None:
         src = source_run_xml.find(qn('w:rPr'))
@@ -47,12 +96,16 @@ def _make_t(text: str):
     return t
 
 
-def build_red_run(text, source_run_xml=None):
-    r = OxmlElement('w:r')
-    rPr = _base_rPr(source_run_xml)
+def _clean_rPr(rPr):
     for tag in ('w:color', 'w:strike', 'w:highlight'):
         for el in rPr.findall(qn(tag)):
             rPr.remove(el)
+    return rPr
+
+
+def build_red_run(text, source_run_xml=None):
+    r = OxmlElement('w:r')
+    rPr = _clean_rPr(_base_rPr(source_run_xml))
     color = OxmlElement('w:color')
     color.set(qn('w:val'), 'FF0000')
     rPr.append(color)
@@ -61,14 +114,11 @@ def build_red_run(text, source_run_xml=None):
     return r
 
 
-def build_yellow_highlight_run(text, source_run_xml=None):
+def build_highlight_run(text, color, source_run_xml=None):
     r = OxmlElement('w:r')
-    rPr = _base_rPr(source_run_xml)
-    for tag in ('w:color', 'w:strike', 'w:highlight'):
-        for el in rPr.findall(qn(tag)):
-            rPr.remove(el)
+    rPr = _clean_rPr(_base_rPr(source_run_xml))
     hl = OxmlElement('w:highlight')
-    hl.set(qn('w:val'), 'yellow')
+    hl.set(qn('w:val'), color)
     rPr.append(hl)
     r.append(rPr)
     r.append(_make_t(text))
@@ -82,85 +132,174 @@ def build_normal_run(text, source_run_xml=None):
     return r
 
 
-def replace_in_paragraph(para, replacements: dict):
+# ─────────────────────────────────────────────
+# Per-paragraph replacement
+# ─────────────────────────────────────────────
+def build_exact_regex(replacements):
+    """Compile ONE regex matching any dictionary key (longest first). Built once
+    per run instead of 600 separate regexes per paragraph — the big speed win."""
+    keys = sorted(replacements.keys(), key=len, reverse=True)
+    if not keys:
+        return None
+    alt = "|".join(re.escape(k) for k in keys)
+    return re.compile(r'(?<![A-Za-z])(' + alt + r')(?![A-Za-z])', re.IGNORECASE)
+
+
+def replace_in_paragraph(para, exact_re, replacements, engine, enable_engine):
+    """Return list of change dicts: {orig, repl, tier, conf, reason}."""
     full_text = "".join(run.text for run in para.runs)
     if not full_text.strip():
-        return 0, []
+        return []
 
-    sorted_keys = sorted(replacements.keys(), key=len, reverse=True)
-    spans = []
-    for key in sorted_keys:
-        pattern = r'(?<![A-Za-z])' + re.escape(key) + r'(?![A-Za-z])'
-        for m in re.finditer(pattern, full_text, flags=re.IGNORECASE):
-            if not any(s < m.end() and m.start() < e for s, e, _ in spans):
-                spans.append((m.start(), m.end(), replacements[key]))
+    # 1) exact dictionary spans — single regex pass, matches are non-overlapping
+    spans = []  # (start, end, replacement, tier, conf, reason)
+    if exact_re is not None:
+        for m in exact_re.finditer(full_text):
+            rep = replacements.get(m.group(1).lower())
+            if rep is not None:
+                spans.append((m.start(), m.end(), rep, "exact", 1.0, "dictionary"))
+
+    # 2) engine suggestions on remaining words
+    if enable_engine and engine is not None:
+        for m in re.finditer(r'[A-Za-z]+', full_text):
+            if any(s < m.end() and m.start() < e for s, e, *_ in spans):
+                continue
+            sug = engine.suggest(m.group(0))
+            if sug is None or sug.confidence < SUGGEST_FLOOR:
+                continue
+            tier = "fix" if sug.confidence >= FIX_CUTOFF else "suggest"
+            spans.append((m.start(), m.end(), sug.correction, tier, sug.confidence, sug.reason))
 
     if not spans:
-        return 0, []
+        return []
 
     spans.sort(key=lambda x: x[0])
-    changed = [(full_text[s:e], r) for s, e, r in spans]
+    changes = [
+        {"orig": full_text[s:e], "repl": rep, "tier": tier, "conf": conf, "reason": reason}
+        for s, e, rep, tier, conf, reason in spans
+    ]
 
+    # rebuild the paragraph
     first_run_xml = para.runs[0]._r if para.runs else None
     p_xml = para._p
     for r in p_xml.findall(qn('w:r')):
         p_xml.remove(r)
 
     pos = 0
-    for (start, end, replacement) in spans:
+    for (start, end, replacement, tier, conf, reason) in spans:
         if pos < start:
             p_xml.append(build_normal_run(full_text[pos:start], first_run_xml))
         p_xml.append(build_red_run(full_text[start:end], first_run_xml))
         p_xml.append(build_normal_run(' ', first_run_xml))
-        p_xml.append(build_yellow_highlight_run(replacement, first_run_xml))
+        p_xml.append(build_highlight_run(replacement, TIER_HL[tier], first_run_xml))
         pos = end
-
     if pos < len(full_text):
         p_xml.append(build_normal_run(full_text[pos:], first_run_xml))
 
-    return len(spans), changed
+    return changes
 
 
-def process_document(dict_bytes: bytes, input_bytes: bytes):
-    replacements = load_dictionary(dict_bytes)
+def process_document(dict_bytes, input_bytes, enable_engine, progress_cb=None):
+    """progress_cb(done, total, stage_msg) is called as work proceeds (optional)."""
+    t_start = time.perf_counter()
+
+    def report(done, total, msg):
+        if progress_cb:
+            progress_cb(done, total, msg)
+
+    report(0, 1, "Reading dictionary…")
+    replacements, pairs = load_dictionary(dict_bytes)
+    exact_re = build_exact_regex(replacements)
+
+    report(0, 1, "Training pattern engine…")
+    engine = SuggestEngine(pairs) if enable_engine else None
+
+    report(0, 1, "Opening subtitle file…")
     doc = Document(io.BytesIO(input_bytes))
-    total, all_changes = 0, []
-    for para in doc.paragraphs:
-        n, ch = replace_in_paragraph(para, replacements)
-        total += n; all_changes.extend(ch)
+
+    # gather every paragraph up-front so we know the total for the progress bar
+    paras = list(doc.paragraphs)
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
-                for para in cell.paragraphs:
-                    n, ch = replace_in_paragraph(para, replacements)
-                    total += n; all_changes.extend(ch)
+                paras.extend(cell.paragraphs)
+    total = len(paras)
+    log.info("Scanning %d paragraphs (engine=%s)…", total, "on" if enable_engine else "off")
+
+    all_changes = []
+    t_scan = time.perf_counter()
+    for i, para in enumerate(paras, 1):
+        all_changes.extend(replace_in_paragraph(para, exact_re, replacements, engine, enable_engine))
+        if i % 200 == 0 or i == total:
+            log.info("  …%d/%d paragraphs, %d changes so far", i, total, len(all_changes))
+            report(i, total, f"Scanning paragraphs… {i}/{total}")
+    log.info("Scan done: %d changes in %.2fs", len(all_changes), time.perf_counter( ) - t_scan)
+
+    if engine is not None:
+        log.info("Engine cache: %d unique words looked up", len(engine._cache))
+
+    report(total, total, "Saving fixed file…")
     out = io.BytesIO()
     doc.save(out)
     out.seek(0)
-    return out, total, replacements, all_changes
+    log.info("process_document finished in %.2fs total", time.perf_counter() - t_start)
+    return out, replacements, all_changes
+
+
+def build_dictionary_export(changes):
+    """Make a 3-column docx (same format) of engine-found pairs to paste back."""
+    seen, rows = set(), []
+    for ch in changes:
+        if ch["tier"] == "exact":
+            continue
+        key = (ch["orig"].lower(), ch["repl"])
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append((ch["orig"], ch["repl"]))
+
+    doc = Document()
+    doc.add_heading("Engine-found corrections (review before merging)", level=1)
+    table = doc.add_table(rows=1, cols=3)
+    table.style = "Table Grid"
+    hdr = table.rows[0].cells
+    hdr[0].text, hdr[1].text, hdr[2].text = "", "AI Version", "Planet Read Version"
+    for i, (a, b) in enumerate(rows, 1):
+        cells = table.add_row().cells
+        cells[0].text, cells[1].text, cells[2].text = str(i), a, b
+    out = io.BytesIO()
+    doc.save(out)
+    out.seek(0)
+    return out, len(rows)
 
 
 # ─────────────────────────────────────────────
 # Streamlit UI
 # ─────────────────────────────────────────────
-
-st.set_page_config(
-    page_title="PlanetRead – Romanized Docx Fixer",
-    page_icon="📖",
-    layout="wide"
-)
+st.set_page_config(page_title="PlanetRead – Romanized Docx Fixer", page_icon="📖", layout="wide")
 
 st.markdown("""
     <h1 style='color:#E05C00;'>📖 PlanetRead – Romanized Docx Fixer</h1>
     <p style='color:#555; font-size:16px;'>
-        Upload the <b>Universal Dictionary</b> and a <b>Romanized subtitle docx</b>.<br>
-        Each correction will show:
-        <span style='color:red; font-weight:bold;'>wrong word</span>
-        &nbsp;
-        <span style='background:yellow; padding:2px 6px;'>correct word</span>
+        Upload the <b>Universal Dictionary</b> and a <b>Romanized subtitle docx</b>.
+    </p>
+    <p style='font-size:14px;'>
+      <span style='background:yellow;padding:2px 8px;border-radius:4px;'>yellow</span>
+      = confirmed dictionary fix &nbsp;·&nbsp;
+      <span style='background:#9bffb0;padding:2px 8px;border-radius:4px;'>green</span>
+      = engine fix (please confirm) &nbsp;·&nbsp;
+      <span style='background:#9bf6ff;padding:2px 8px;border-radius:4px;'>cyan</span>
+      = engine guess (review carefully)
     </p>
     <hr>
 """, unsafe_allow_html=True)
+
+enable_engine = st.sidebar.checkbox("🧠 Enable AI pattern engine", value=True)
+st.sidebar.caption(
+    "Learns spelling-correction patterns from your dictionary and applies them to "
+    "words **not** in the table. Offline, no internet. ~75–80% precise on novel words, "
+    "so its fixes are flagged for your review, never silently applied."
+)
 
 col1, col2 = st.columns(2)
 with col1:
@@ -173,63 +312,90 @@ with col2:
 st.markdown("<br>", unsafe_allow_html=True)
 
 if dict_file and input_file:
-    with st.expander("👁️ Preview Dictionary (first 20 pairs)", expanded=False):
-        d = load_dictionary(dict_file.read())
-        dict_file.seek(0)
-        items = list(d.items())[:20]
-        st.table({"AI Version": [k for k, v in items], "PlanetRead Version": [v for k, v in items]})
-        st.caption(f"Total pairs loaded: **{len(d)}**")
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
     if st.button("🚀 Run Replacements", type="primary", use_container_width=True):
-        with st.spinner("Processing document…"):
-            try:
-                output_bytes, total, replacements, all_changes = process_document(
-                    dict_file.read(), input_file.read()
+        progress = st.progress(0.0, text="Starting…")
+        status = st.empty()
+        t_ui = time.perf_counter()
+
+        def on_progress(done, total, msg):
+            frac = min(1.0, done / total) if total else 0.0
+            progress.progress(frac, text=msg)
+            status.caption(f"⏱️ {time.perf_counter() - t_ui:.1f}s — {msg}")
+
+        try:
+                output_bytes, replacements, all_changes = process_document(
+                    dict_file.read(), input_file.read(), enable_engine,
+                    progress_cb=on_progress,
                 )
+                progress.progress(1.0, text="Done!")
 
-                st.success(f"✅ Done! **{total} replacement(s)** made across the document.")
+                by_tier = {"exact": [], "fix": [], "suggest": []}
+                for ch in all_changes:
+                    by_tier[ch["tier"]].append(ch)
+                total = len(all_changes)
 
-                m1, m2, m3 = st.columns(3)
+                st.success(f"✅ Done! **{total} change(s)** across the document.")
+
+                m1, m2, m3, m4 = st.columns(4)
                 m1.metric("Dictionary Pairs", len(replacements))
-                m2.metric("Replacements Made", total)
-                m3.metric("Unique Words Changed", len(set(o for o, _ in all_changes)))
+                m2.metric("✅ Dictionary Fixes", len(by_tier["exact"]))
+                m3.metric("🟢 Engine Fixes", len(by_tier["fix"]))
+                m4.metric("🔵 Engine Guesses", len(by_tier["suggest"]))
 
-                if all_changes:
-                    st.markdown("### 🔄 Changes Made")
-
-                    change_counts = Counter((o, r) for o, r in all_changes)
-                    rows = sorted(change_counts.items(), key=lambda x: -x[1])
-
-                    # Header row
-                    h1, h2, h3, h4 = st.columns([0.5, 3, 3, 1])
-                    h1.markdown("<span style='color:#888; font-size:13px'>#</span>", unsafe_allow_html=True)
-                    h2.markdown("<b>AI Version (Wrong)</b>", unsafe_allow_html=True)
-                    h3.markdown("<b>PlanetRead Version (Fixed)</b>", unsafe_allow_html=True)
+                def render_tier(title, items, color, note):
+                    if not items:
+                        return
+                    st.markdown(f"### {title}")
+                    if note:
+                        st.caption(note)
+                    counts = Counter((c["orig"], c["repl"]) for c in items)
+                    confs = {(c["orig"], c["repl"]): c["conf"] for c in items}
+                    rows = sorted(counts.items(), key=lambda x: -x[1])
+                    h1, h2, h3, h4 = st.columns([3, 3, 1, 1])
+                    h1.markdown("<b>Wrong (in file)</b>", unsafe_allow_html=True)
+                    h2.markdown("<b>Correction</b>", unsafe_allow_html=True)
+                    h3.markdown("<b>Conf.</b>", unsafe_allow_html=True)
                     h4.markdown("<b>Count</b>", unsafe_allow_html=True)
                     st.divider()
-
-                    for i, ((orig, corr), cnt) in enumerate(rows, 1):
-                        c1, c2, c3, c4 = st.columns([0.5, 3, 3, 1])
-                        c1.markdown(f"<span style='color:#aaa; font-size:13px'>{i}</span>", unsafe_allow_html=True)
-                        c2.markdown(f"<span style='color:red; font-weight:bold; font-size:15px'>{orig}</span>", unsafe_allow_html=True)
-                        c3.markdown(f"<span style='background:yellow; padding:2px 10px; border-radius:4px; font-weight:bold; font-size:15px'>{corr}</span>", unsafe_allow_html=True)
+                    for (orig, corr), cnt in rows:
+                        c1, c2, c3, c4 = st.columns([3, 3, 1, 1])
+                        c1.markdown(f"<span style='color:red;font-weight:bold'>{orig}</span>", unsafe_allow_html=True)
+                        c2.markdown(f"<span style='background:{color};padding:2px 10px;border-radius:4px;font-weight:bold'>{corr}</span>", unsafe_allow_html=True)
+                        cf = confs[(orig, corr)]
+                        c3.markdown("—" if cf >= 1.0 else f"{cf*100:.0f}%")
                         c4.markdown(f"**{cnt}**")
 
-                st.markdown("<br>", unsafe_allow_html=True)
-                st.markdown("### 📥 Download Fixed File")
-                out_name = input_file.name.replace(".docx", "_fixed.docx")
-                st.download_button(
-                    label=f"⬇️ Download  {out_name}",
-                    data=output_bytes,
-                    file_name=out_name,
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    use_container_width=True,
-                    type="primary"
-                )
+                render_tier("✅ Confirmed Dictionary Fixes", by_tier["exact"], "yellow",
+                            "Exact matches from your dictionary.")
+                render_tier("🟢 Engine Fixes — please confirm", by_tier["fix"], "#9bffb0",
+                            "Learned patterns, higher confidence. Review and accept in Word.")
+                render_tier("🔵 Engine Guesses — review carefully", by_tier["suggest"], "#9bf6ff",
+                            "Lower confidence. The engine is unsure — check each before accepting.")
 
-            except Exception as e:
+                st.markdown("<br>", unsafe_allow_html=True)
+                d1, d2 = st.columns(2)
+                with d1:
+                    st.markdown("#### 📥 Fixed File")
+                    out_name = input_file.name.replace(".docx", "_fixed.docx")
+                    st.download_button(
+                        f"⬇️ {out_name}", data=output_bytes, file_name=out_name,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True, type="primary",
+                    )
+                with d2:
+                    st.markdown("#### 🔁 Grow the Dictionary")
+                    exp_bytes, n_new = build_dictionary_export(all_changes)
+                    st.download_button(
+                        f"⬇️ Engine-found pairs ({n_new})",
+                        data=exp_bytes, file_name="engine_found_pairs.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True, disabled=(n_new == 0),
+                    )
+                    st.caption("Review, delete wrong rows, paste the rest into the master dictionary. "
+                               "Next run they become confirmed exact matches.")
+
+        except Exception as e:
+                log.exception("Processing failed")
                 st.error(f"Something went wrong: {e}")
                 st.exception(e)
 
