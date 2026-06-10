@@ -273,6 +273,47 @@ def build_dictionary_export(changes):
     return out, len(rows)
 
 
+# regex for an SRT timecode line: 00:00:01,200 --> 00:00:04,000
+TIMECODE_RE = re.compile(
+    r'\d{1,2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d{3}'
+)
+
+
+def build_srt(input_bytes, replacements):
+    """Build a clean .srt from the subtitle Word file.
+
+    - applies ONLY the confirmed dictionary (yellow) corrections — wrong word is
+      replaced by the correct word, with NO red/green/cyan markup at all
+    - engine guesses are NOT applied (original word kept) — they're unconfirmed
+    - timecodes / block numbers already present in the Word text are preserved
+
+    Returns (srt_bytes, num_timecodes, num_corrections).
+    """
+    exact_re = build_exact_regex(replacements)
+    n_fixes = 0
+
+    def fix_line(text):
+        nonlocal n_fixes
+        if exact_re is None:
+            return text
+
+        def repl(m):
+            nonlocal n_fixes
+            rep = replacements.get(m.group(1).lower())
+            if rep is None:
+                return m.group(0)
+            n_fixes += 1
+            return rep
+        return exact_re.sub(repl, text)
+
+    doc = Document(io.BytesIO(input_bytes))
+    lines = [fix_line(p.text) for p in doc.paragraphs]
+    srt_text = "\n".join(lines).strip() + "\n"
+    n_codes = len(TIMECODE_RE.findall(srt_text))
+    log.info("SRT built: %d timecodes, %d dictionary corrections applied", n_codes, n_fixes)
+    return srt_text.encode("utf-8"), n_codes, n_fixes
+
+
 # ─────────────────────────────────────────────
 # Streamlit UI
 # ─────────────────────────────────────────────
@@ -323,8 +364,10 @@ if dict_file and input_file:
             status.caption(f"⏱️ {time.perf_counter() - t_ui:.1f}s — {msg}")
 
         try:
+                dict_bytes = dict_file.read()
+                input_bytes = input_file.read()
                 output_bytes, replacements, all_changes = process_document(
-                    dict_file.read(), input_file.read(), enable_engine,
+                    dict_bytes, input_bytes, enable_engine,
                     progress_cb=on_progress,
                 )
                 progress.progress(1.0, text="Done!")
@@ -373,16 +416,34 @@ if dict_file and input_file:
                             "Lower confidence. The engine is unsure — check each before accepting.")
 
                 st.markdown("<br>", unsafe_allow_html=True)
-                d1, d2 = st.columns(2)
+                base = input_file.name.rsplit(".docx", 1)[0]
+                d1, d2, d3 = st.columns(3)
                 with d1:
-                    st.markdown("#### 📥 Fixed File")
-                    out_name = input_file.name.replace(".docx", "_fixed.docx")
+                    st.markdown("#### 📥 Fixed Word File")
+                    out_name = base + "_fixed.docx"
                     st.download_button(
                         f"⬇️ {out_name}", data=output_bytes, file_name=out_name,
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                         use_container_width=True, type="primary",
                     )
+                    st.caption("Review file with red/yellow/green/cyan markup.")
                 with d2:
+                    st.markdown("#### 🎞️ Clean SRT")
+                    srt_bytes, n_codes, n_fixes = build_srt(input_bytes, replacements)
+                    srt_name = base + ".srt"
+                    st.download_button(
+                        f"⬇️ {srt_name}", data=srt_bytes, file_name=srt_name,
+                        mime="application/x-subrip",
+                        use_container_width=True, type="primary",
+                    )
+                    if n_codes == 0:
+                        st.warning("⚠️ No timecodes found in the file — the .srt may "
+                                   "not have valid timings.")
+                    else:
+                        st.caption(f"Plain subtitles, {n_codes} timecodes kept. "
+                                   f"Only confirmed dictionary fixes applied ({n_fixes}); "
+                                   "no markup, no engine guesses.")
+                with d3:
                     st.markdown("#### 🔁 Grow the Dictionary")
                     exp_bytes, n_new = build_dictionary_export(all_changes)
                     st.download_button(
@@ -391,8 +452,7 @@ if dict_file and input_file:
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                         use_container_width=True, disabled=(n_new == 0),
                     )
-                    st.caption("Review, delete wrong rows, paste the rest into the master dictionary. "
-                               "Next run they become confirmed exact matches.")
+                    st.caption("Review, delete wrong rows, paste into the master dictionary.")
 
         except Exception as e:
                 log.exception("Processing failed")
