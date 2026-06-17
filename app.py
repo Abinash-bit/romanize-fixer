@@ -2,6 +2,7 @@ import streamlit as st
 import re
 import copy
 import io
+import os
 import time
 import logging
 from docx import Document
@@ -10,6 +11,15 @@ from docx.oxml import OxmlElement
 from collections import Counter
 
 from suggest import SuggestEngine
+import romanize_srt
+
+# Load ANTHROPIC_API_KEY (and friends) from a local .env if present. python-dotenv
+# strips the whitespace around `KEY = value`, so the existing .env format works.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:  # pragma: no cover - optional dependency
+    pass
 
 # ─────────────────────────────────────────────
 # Logging — shows in the terminal where you ran `streamlit run app.py`
@@ -317,13 +327,225 @@ def build_srt(input_bytes, replacements):
 # ─────────────────────────────────────────────
 # Streamlit UI
 # ─────────────────────────────────────────────
-st.set_page_config(page_title="PlanetRead – Romanized Docx Fixer", page_icon="📖", layout="wide")
+st.set_page_config(page_title="PlanetRead – Romanizer", page_icon="📖", layout="wide")
+
+
+def resolve_api_key():
+    """Find the Anthropic key from the environment (.env locally) or from Streamlit
+    Secrets (the cloud path), and export it so anthropic.Anthropic() picks it up."""
+    key = os.getenv("ANTHROPIC_API_KEY")
+    if not key:
+        try:
+            key = st.secrets.get("ANTHROPIC_API_KEY")
+        except Exception:
+            key = None
+        if key:
+            os.environ["ANTHROPIC_API_KEY"] = key
+    return key
+
+
+def render_corrections_ui(n_pairs, all_changes):
+    """Shared results view: metrics + the three tiered correction tables."""
+    by_tier = {"exact": [], "fix": [], "suggest": []}
+    for ch in all_changes:
+        by_tier[ch["tier"]].append(ch)
+    total = len(all_changes)
+
+    st.success(f"✅ **{total} change(s)** found.")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Dictionary Pairs", n_pairs)
+    m2.metric("✅ Dictionary Fixes", len(by_tier["exact"]))
+    m3.metric("🟢 Engine Fixes", len(by_tier["fix"]))
+    m4.metric("🔵 Engine Guesses", len(by_tier["suggest"]))
+
+    def render_tier(title, items, color, note):
+        if not items:
+            return
+        st.markdown(f"### {title}")
+        if note:
+            st.caption(note)
+        counts = Counter((c["orig"], c["repl"]) for c in items)
+        confs = {(c["orig"], c["repl"]): c["conf"] for c in items}
+        rows = sorted(counts.items(), key=lambda x: -x[1])
+        h1, h2, h3, h4 = st.columns([3, 3, 1, 1])
+        h1.markdown("<b>Wrong (in file)</b>", unsafe_allow_html=True)
+        h2.markdown("<b>Correction</b>", unsafe_allow_html=True)
+        h3.markdown("<b>Conf.</b>", unsafe_allow_html=True)
+        h4.markdown("<b>Count</b>", unsafe_allow_html=True)
+        st.divider()
+        for (orig, corr), cnt in rows:
+            c1, c2, c3, c4 = st.columns([3, 3, 1, 1])
+            c1.markdown(f"<span style='color:red;font-weight:bold'>{orig}</span>", unsafe_allow_html=True)
+            c2.markdown(f"<span style='background:{color};padding:2px 10px;border-radius:4px;font-weight:bold'>{corr}</span>", unsafe_allow_html=True)
+            cf = confs[(orig, corr)]
+            c3.markdown("—" if cf >= 1.0 else f"{cf*100:.0f}%")
+            c4.markdown(f"**{cnt}**")
+
+    render_tier("✅ Confirmed Dictionary Fixes", by_tier["exact"], "yellow",
+                "Exact matches from your dictionary.")
+    render_tier("🟢 Engine Fixes — please confirm", by_tier["fix"], "#9bffb0",
+                "Learned patterns, higher confidence. Review and accept in Word.")
+    render_tier("🔵 Engine Guesses — review carefully", by_tier["suggest"], "#9bf6ff",
+                "Lower confidence. The engine is unsure — check each before accepting.")
+
+
+def render_page(enable_engine):
+    """Single staged flow: romanize the SRT first, then apply the dictionary."""
+    st.markdown(
+        "Romanize a native-script subtitle (Hindi, Punjabi, Marathi, Tamil, Telugu, "
+        "Kannada, Gujarati) with Claude, then apply the dictionary to get the final "
+        "corrected `.srt`."
+    )
+
+    has_key = bool(resolve_api_key())
+    if not romanize_srt.anthropic_available():
+        st.error("The `anthropic` package isn't installed. Run "
+                 "`pip install -r requirements.txt`.")
+    elif not has_key:
+        st.warning("⚠️ No `ANTHROPIC_API_KEY` found. Add it to a `.env` file (local) or "
+                   "to **Secrets** (Streamlit Cloud), e.g. `ANTHROPIC_API_KEY = sk-ant-...`.")
+
+    # ── ① Upload subtitle + pick language → romanize ─────────────────────
+    st.subheader("① Upload subtitle & romanize")
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        srt_file = st.file_uploader("Native-script subtitle (.srt)", type=["srt"], key="srt_input")
+    with c2:
+        language = st.selectbox("Source language", list(romanize_srt.LANGUAGES.keys()), key="srt_lang")
+
+    can_romanize = bool(srt_file) and has_key and romanize_srt.anthropic_available()
+    if srt_file and st.button("🌐 Romanize SRT", type="primary",
+                              use_container_width=True, key="run_romanize",
+                              disabled=not can_romanize):
+        progress = st.progress(0.0, text="Contacting Anthropic…")
+        status = st.empty()
+        t_ui = time.perf_counter()
+
+        def on_progress(done, total):
+            frac = min(1.0, done / total) if total else 0.0
+            progress.progress(frac, text=f"Romanizing lines… {done}/{total}")
+            status.caption(f"⏱️ {time.perf_counter() - t_ui:.1f}s")
+
+        try:
+            srt_bytes = srt_file.read()
+            romanized_text, stats = romanize_srt.romanize_srt_bytes(
+                srt_bytes, language, progress_cb=on_progress,
+            )
+            progress.progress(1.0, text="Romanization done!")
+            # A fresh romanization invalidates any earlier dictionary result.
+            st.session_state["srt_result"] = {
+                "base": srt_file.name.rsplit(".srt", 1)[0],
+                "romanized_text": romanized_text,
+                "stats": stats,
+                "has_dict": False,
+            }
+        except Exception as e:
+            log.exception("SRT romanization failed")
+            st.session_state.pop("srt_result", None)
+            st.error(f"Something went wrong: {e}")
+            st.exception(e)
+
+    if not srt_file:
+        st.info("👆 Upload a native-script `.srt` and choose its language.")
+
+    res = st.session_state.get("srt_result")
+    if not res:
+        return
+
+    # ── show romanized output ────────────────────────────────────────────
+    stats = res["stats"]
+    msg = f"✅ Romanized {stats['lines']} line(s) across {stats['blocks']} block(s)."
+    if stats.get("missing"):
+        msg += f" ⚠️ {stats['missing']} line(s) kept as-is (model didn't return them)."
+    if stats.get("cached"):
+        msg += " ♻️ Loaded from cache — no Anthropic call."
+    st.success(msg)
+    st.download_button(
+        f"⬇️ {res['base']}_romanized.srt", data=res["romanized_text"].encode("utf-8"),
+        file_name=f"{res['base']}_romanized.srt", mime="application/x-subrip",
+        use_container_width=True, key="dl_srt_romanized",
+    )
+
+    # ── ② Upload dictionary → run ────────────────────────────────────────
+    st.divider()
+    st.subheader("② Apply the dictionary")
+    dict_file = st.file_uploader("Universal Dictionary (.docx)", type=["docx"], key="srt_dict")
+
+    if dict_file and st.button("🚀 Run", type="primary", use_container_width=True, key="run_dict"):
+        try:
+            with st.spinner("Applying dictionary…"):
+                dict_bytes = dict_file.read()
+                # Reuse the existing fixer: wrap the romanized SRT in a docx and run it
+                # through the same dictionary + engine pipeline.
+                rom_docx = romanize_srt.srt_text_to_docx_bytes(res["romanized_text"])
+                output_bytes, replacements, all_changes = process_document(
+                    dict_bytes, rom_docx, enable_engine,
+                )
+                srt_final, n_codes, n_fixes = build_srt(rom_docx, replacements)
+                exp_bytes, n_new = build_dictionary_export(all_changes)
+            res.update({
+                "has_dict": True,
+                "n_pairs": len(replacements),
+                "all_changes": all_changes,
+                "review_docx": output_bytes.getvalue(),
+                "srt_final": srt_final,
+                "n_codes": n_codes,
+                "n_fixes": n_fixes,
+                "engine_pairs": exp_bytes.getvalue(),
+                "n_new": n_new,
+            })
+            st.session_state["srt_result"] = res
+        except Exception as e:
+            log.exception("Dictionary step failed")
+            st.error(f"Something went wrong: {e}")
+            st.exception(e)
+
+    if not dict_file:
+        st.info("👆 Upload the Universal Dictionary (.docx), then click **Run**.")
+
+    if not res.get("has_dict"):
+        return
+
+    # ── show dictionary results ──────────────────────────────────────────
+    st.divider()
+    st.markdown("### 🔤 Dictionary corrections")
+    render_corrections_ui(res["n_pairs"], res["all_changes"])
+
+    base = res["base"]
+    st.markdown("<br>", unsafe_allow_html=True)
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        st.markdown("#### 🎞️ Final SRT")
+        st.download_button(
+            f"⬇️ {base}_romanized_fixed.srt", data=res["srt_final"],
+            file_name=f"{base}_romanized_fixed.srt", mime="application/x-subrip",
+            use_container_width=True, type="primary", key="dl_srt_final",
+        )
+        st.caption(f"Romanized + {res['n_fixes']} confirmed dictionary fix(es), "
+                   f"{res['n_codes']} timecodes kept. No markup, no engine guesses.")
+    with d2:
+        st.markdown("#### 📥 Review Word File")
+        st.download_button(
+            f"⬇️ {base}_review.docx", data=res["review_docx"],
+            file_name=f"{base}_review.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True, key="dl_srt_review",
+        )
+        st.caption("Romanized text with red/yellow/green/cyan markup to review.")
+    with d3:
+        st.markdown("#### 🔁 Grow the Dictionary")
+        st.download_button(
+            f"⬇️ Engine-found pairs ({res['n_new']})",
+            data=res["engine_pairs"], file_name="engine_found_pairs.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True, disabled=(res["n_new"] == 0), key="dl_srt_pairs",
+        )
+        st.caption("Review, delete wrong rows, paste into the master dictionary.")
+
 
 st.markdown("""
-    <h1 style='color:#E05C00;'>📖 PlanetRead – Romanized Docx Fixer</h1>
-    <p style='color:#555; font-size:16px;'>
-        Upload the <b>Universal Dictionary</b> and a <b>Romanized subtitle docx</b>.
-    </p>
+    <h1 style='color:#E05C00;'>📖 PlanetRead – Romanizer</h1>
     <p style='font-size:14px;'>
       <span style='background:yellow;padding:2px 8px;border-radius:4px;'>yellow</span>
       = confirmed dictionary fix &nbsp;·&nbsp;
@@ -342,128 +564,16 @@ st.sidebar.caption(
     "so its fixes are flagged for your review, never silently applied."
 )
 
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("📚 Step 1 — Upload Dictionary")
-    dict_file = st.file_uploader("Universal Dictionary (.docx)", type=["docx"], key="dict")
-with col2:
-    st.subheader("🎬 Step 2 — Upload Subtitle File")
-    input_file = st.file_uploader("Romanized Subtitle (.docx)", type=["docx"], key="input")
+st.sidebar.divider()
+st.sidebar.caption(
+    "Romanized SRTs are cached on disk by file + language, so re-running the same "
+    "file never calls Anthropic again."
+)
+if st.sidebar.button("🧹 Clear romanization cache"):
+    n = romanize_srt.clear_cache()
+    st.session_state.pop("srt_result", None)
+    st.sidebar.success(f"Cleared {n} cached romanization(s).")
 
-st.markdown("<br>", unsafe_allow_html=True)
-
-if dict_file and input_file:
-    if st.button("🚀 Run Replacements", type="primary", use_container_width=True):
-        progress = st.progress(0.0, text="Starting…")
-        status = st.empty()
-        t_ui = time.perf_counter()
-
-        def on_progress(done, total, msg):
-            frac = min(1.0, done / total) if total else 0.0
-            progress.progress(frac, text=msg)
-            status.caption(f"⏱️ {time.perf_counter() - t_ui:.1f}s — {msg}")
-
-        try:
-                dict_bytes = dict_file.read()
-                input_bytes = input_file.read()
-                output_bytes, replacements, all_changes = process_document(
-                    dict_bytes, input_bytes, enable_engine,
-                    progress_cb=on_progress,
-                )
-                progress.progress(1.0, text="Done!")
-
-                by_tier = {"exact": [], "fix": [], "suggest": []}
-                for ch in all_changes:
-                    by_tier[ch["tier"]].append(ch)
-                total = len(all_changes)
-
-                st.success(f"✅ Done! **{total} change(s)** across the document.")
-
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Dictionary Pairs", len(replacements))
-                m2.metric("✅ Dictionary Fixes", len(by_tier["exact"]))
-                m3.metric("🟢 Engine Fixes", len(by_tier["fix"]))
-                m4.metric("🔵 Engine Guesses", len(by_tier["suggest"]))
-
-                def render_tier(title, items, color, note):
-                    if not items:
-                        return
-                    st.markdown(f"### {title}")
-                    if note:
-                        st.caption(note)
-                    counts = Counter((c["orig"], c["repl"]) for c in items)
-                    confs = {(c["orig"], c["repl"]): c["conf"] for c in items}
-                    rows = sorted(counts.items(), key=lambda x: -x[1])
-                    h1, h2, h3, h4 = st.columns([3, 3, 1, 1])
-                    h1.markdown("<b>Wrong (in file)</b>", unsafe_allow_html=True)
-                    h2.markdown("<b>Correction</b>", unsafe_allow_html=True)
-                    h3.markdown("<b>Conf.</b>", unsafe_allow_html=True)
-                    h4.markdown("<b>Count</b>", unsafe_allow_html=True)
-                    st.divider()
-                    for (orig, corr), cnt in rows:
-                        c1, c2, c3, c4 = st.columns([3, 3, 1, 1])
-                        c1.markdown(f"<span style='color:red;font-weight:bold'>{orig}</span>", unsafe_allow_html=True)
-                        c2.markdown(f"<span style='background:{color};padding:2px 10px;border-radius:4px;font-weight:bold'>{corr}</span>", unsafe_allow_html=True)
-                        cf = confs[(orig, corr)]
-                        c3.markdown("—" if cf >= 1.0 else f"{cf*100:.0f}%")
-                        c4.markdown(f"**{cnt}**")
-
-                render_tier("✅ Confirmed Dictionary Fixes", by_tier["exact"], "yellow",
-                            "Exact matches from your dictionary.")
-                render_tier("🟢 Engine Fixes — please confirm", by_tier["fix"], "#9bffb0",
-                            "Learned patterns, higher confidence. Review and accept in Word.")
-                render_tier("🔵 Engine Guesses — review carefully", by_tier["suggest"], "#9bf6ff",
-                            "Lower confidence. The engine is unsure — check each before accepting.")
-
-                st.markdown("<br>", unsafe_allow_html=True)
-                base = input_file.name.rsplit(".docx", 1)[0]
-                d1, d2, d3 = st.columns(3)
-                with d1:
-                    st.markdown("#### 📥 Fixed Word File")
-                    out_name = base + "_fixed.docx"
-                    st.download_button(
-                        f"⬇️ {out_name}", data=output_bytes, file_name=out_name,
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        use_container_width=True, type="primary",
-                    )
-                    st.caption("Review file with red/yellow/green/cyan markup.")
-                with d2:
-                    st.markdown("#### 🎞️ Clean SRT")
-                    srt_bytes, n_codes, n_fixes = build_srt(input_bytes, replacements)
-                    srt_name = base + ".srt"
-                    st.download_button(
-                        f"⬇️ {srt_name}", data=srt_bytes, file_name=srt_name,
-                        mime="application/x-subrip",
-                        use_container_width=True, type="primary",
-                    )
-                    if n_codes == 0:
-                        st.warning("⚠️ No timecodes found in the file — the .srt may "
-                                   "not have valid timings.")
-                    else:
-                        st.caption(f"Plain subtitles, {n_codes} timecodes kept. "
-                                   f"Only confirmed dictionary fixes applied ({n_fixes}); "
-                                   "no markup, no engine guesses.")
-                with d3:
-                    st.markdown("#### 🔁 Grow the Dictionary")
-                    exp_bytes, n_new = build_dictionary_export(all_changes)
-                    st.download_button(
-                        f"⬇️ Engine-found pairs ({n_new})",
-                        data=exp_bytes, file_name="engine_found_pairs.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        use_container_width=True, disabled=(n_new == 0),
-                    )
-                    st.caption("Review, delete wrong rows, paste into the master dictionary.")
-
-        except Exception as e:
-                log.exception("Processing failed")
-                st.error(f"Something went wrong: {e}")
-                st.exception(e)
-
-elif not dict_file and not input_file:
-    st.info("👆 Upload both files above to get started.")
-elif not dict_file:
-    st.warning("Please upload the Dictionary file.")
-else:
-    st.warning("Please upload the Subtitle file.")
+render_page(enable_engine)
 
 st.markdown("<br><hr><p style='text-align:center; color:#aaa; font-size:13px;'>PlanetRead · Romanized Shabdkosh Tool</p>", unsafe_allow_html=True)
