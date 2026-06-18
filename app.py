@@ -289,6 +289,19 @@ TIMECODE_RE = re.compile(
 )
 
 
+def _match_case(matched, replacement):
+    """Make a correction follow the case of the word it replaces, so it is
+    capitalised only where the original word was (start of a sentence / proper
+    noun) and stays lowercase mid-sentence — instead of the dictionary's stored
+    capitalisation leaking capital letters into the middle of a sentence."""
+    if not replacement:
+        return replacement
+    rep = replacement.lower()                 # canonical lowercase base form
+    if matched[:1].isupper():
+        rep = rep[:1].upper() + rep[1:]        # original was capitalised -> match it
+    return rep
+
+
 def build_srt(input_bytes, replacements):
     """Build a clean .srt from the subtitle Word file.
 
@@ -313,7 +326,7 @@ def build_srt(input_bytes, replacements):
             if rep is None:
                 return m.group(0)
             n_fixes += 1
-            return rep
+            return _match_case(m.group(1), rep)
         return exact_re.sub(repl, text)
 
     doc = Document(io.BytesIO(input_bytes))
@@ -344,14 +357,62 @@ def resolve_api_key():
     return key
 
 
-def render_corrections_ui(n_pairs, all_changes):
-    """Shared results view: metrics + the three tiered correction tables."""
+def _render_readonly_tier(title, items, color, note):
+    """Exact dictionary fixes — always applied, shown for reference (no checkbox)."""
+    if not items:
+        return
+    st.markdown(f"#### {title}")
+    if note:
+        st.caption(note)
+    counts = Counter((c["orig"], c["repl"]) for c in items)
+    for (orig, corr), cnt in sorted(counts.items(), key=lambda x: -x[1]):
+        c1, c2, c3 = st.columns([3, 3, 1])
+        c1.markdown(f"<span style='color:red;font-weight:bold'>{orig}</span>", unsafe_allow_html=True)
+        c2.markdown(f"<span style='background:{color};padding:2px 10px;border-radius:4px;font-weight:bold'>{corr}</span>", unsafe_allow_html=True)
+        c3.markdown(f"×**{cnt}**")
+
+
+def _render_checkbox_tier(title, items, color, tier, scan_id):
+    """Render an engine tier with a tick column. Returns the accepted (orig, repl) set.
+
+    Keys include scan_id so a fresh scan starts every box unticked instead of
+    inheriting stale state mapped to different rows.
+    """
+    sel = set()
+    if not items:
+        return sel
+    st.markdown(f"#### {title}")
+    counts = Counter((c["orig"], c["repl"]) for c in items)
+    confs = {(c["orig"], c["repl"]): c["conf"] for c in items}
+    rows = sorted(counts.items(), key=lambda x: -x[1])
+
+    all_on = st.checkbox(f"Accept all {len(rows)}", key=f"selall_{scan_id}_{tier}")
+
+    h0, h1, h2, h3, h4 = st.columns([0.7, 3, 3, 1, 1])
+    h0.markdown("<b>Use</b>", unsafe_allow_html=True)
+    h1.markdown("<b>Wrong (in file)</b>", unsafe_allow_html=True)
+    h2.markdown("<b>Correction</b>", unsafe_allow_html=True)
+    h3.markdown("<b>Conf.</b>", unsafe_allow_html=True)
+    h4.markdown("<b>Count</b>", unsafe_allow_html=True)
+    for i, ((orig, corr), cnt) in enumerate(rows):
+        c0, c1, c2, c3, c4 = st.columns([0.7, 3, 3, 1, 1])
+        checked = c0.checkbox("keep", key=f"sel_{scan_id}_{tier}_{i}",
+                              disabled=all_on, label_visibility="collapsed")
+        c1.markdown(f"<span style='color:red;font-weight:bold'>{orig}</span>", unsafe_allow_html=True)
+        c2.markdown(f"<span style='background:{color};padding:2px 10px;border-radius:4px;font-weight:bold'>{corr}</span>", unsafe_allow_html=True)
+        c3.markdown(f"{confs[(orig, corr)]*100:.0f}%")
+        c4.markdown(f"**{cnt}**")
+        if all_on or checked:
+            sel.add((orig, corr))
+    return sel
+
+
+def render_selection(all_changes, n_pairs, scan_id):
+    """Metrics + always-applied exact tier + tickable engine tiers. Returns the
+    set of accepted engine (orig, repl) pairs."""
     by_tier = {"exact": [], "fix": [], "suggest": []}
     for ch in all_changes:
         by_tier[ch["tier"]].append(ch)
-    total = len(all_changes)
-
-    st.success(f"✅ **{total} change(s)** found.")
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Dictionary Pairs", n_pairs)
@@ -359,35 +420,86 @@ def render_corrections_ui(n_pairs, all_changes):
     m3.metric("🟢 Engine Fixes", len(by_tier["fix"]))
     m4.metric("🔵 Engine Guesses", len(by_tier["suggest"]))
 
-    def render_tier(title, items, color, note):
-        if not items:
-            return
-        st.markdown(f"### {title}")
-        if note:
-            st.caption(note)
-        counts = Counter((c["orig"], c["repl"]) for c in items)
-        confs = {(c["orig"], c["repl"]): c["conf"] for c in items}
-        rows = sorted(counts.items(), key=lambda x: -x[1])
-        h1, h2, h3, h4 = st.columns([3, 3, 1, 1])
-        h1.markdown("<b>Wrong (in file)</b>", unsafe_allow_html=True)
-        h2.markdown("<b>Correction</b>", unsafe_allow_html=True)
-        h3.markdown("<b>Conf.</b>", unsafe_allow_html=True)
-        h4.markdown("<b>Count</b>", unsafe_allow_html=True)
-        st.divider()
-        for (orig, corr), cnt in rows:
-            c1, c2, c3, c4 = st.columns([3, 3, 1, 1])
-            c1.markdown(f"<span style='color:red;font-weight:bold'>{orig}</span>", unsafe_allow_html=True)
-            c2.markdown(f"<span style='background:{color};padding:2px 10px;border-radius:4px;font-weight:bold'>{corr}</span>", unsafe_allow_html=True)
-            cf = confs[(orig, corr)]
-            c3.markdown("—" if cf >= 1.0 else f"{cf*100:.0f}%")
-            c4.markdown(f"**{cnt}**")
+    _render_readonly_tier("✅ Confirmed Dictionary Fixes (always applied)",
+                          by_tier["exact"], "yellow",
+                          "Exact matches from your dictionary — always applied.")
+    sel = set()
+    sel |= _render_checkbox_tier("🟢 Engine Fixes — tick to keep", by_tier["fix"],
+                                 "#9bffb0", "fix", scan_id)
+    sel |= _render_checkbox_tier("🔵 Engine Guesses — tick to keep", by_tier["suggest"],
+                                 "#9bf6ff", "suggest", scan_id)
+    if not by_tier["fix"] and not by_tier["suggest"]:
+        st.caption("No engine suggestions to review (engine off, or none found).")
+    return sel
 
-    render_tier("✅ Confirmed Dictionary Fixes", by_tier["exact"], "yellow",
-                "Exact matches from your dictionary.")
-    render_tier("🟢 Engine Fixes — please confirm", by_tier["fix"], "#9bffb0",
-                "Learned patterns, higher confidence. Review and accept in Word.")
-    render_tier("🔵 Engine Guesses — review carefully", by_tier["suggest"], "#9bf6ff",
-                "Lower confidence. The engine is unsure — check each before accepting.")
+
+def build_marked_docx(text, apply_re, apply_map, tier_map):
+    """Word review file: each applied correction shown as red original + a
+    tier-coloured highlight of the replacement. Only keys in apply_map are marked."""
+    doc = Document()
+    for line in text.split("\n"):
+        para = doc.add_paragraph()
+        if not line:
+            continue
+        spans = []
+        if apply_re is not None:
+            for m in apply_re.finditer(line):
+                key = m.group(1).lower()
+                rep = apply_map.get(key)
+                if rep is not None:
+                    rep = _match_case(m.group(1), rep)
+                    spans.append((m.start(), m.end(), rep, tier_map.get(key, "exact")))
+        if not spans:
+            para._p.append(build_normal_run(line))
+            continue
+        pos = 0
+        for s, e, rep, tier in spans:
+            if pos < s:
+                para._p.append(build_normal_run(line[pos:s]))
+            para._p.append(build_red_run(line[s:e]))
+            para._p.append(build_normal_run(' '))
+            para._p.append(build_highlight_run(rep, TIER_HL.get(tier, "yellow")))
+            pos = e
+        if pos < len(line):
+            para._p.append(build_normal_run(line[pos:]))
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def build_selected_outputs(romanized_text, replacements, all_changes, selected):
+    """Apply the exact dictionary + only the ticked engine pairs. Returns a dict
+    with the review docx, final SRT, engine-pairs export, and counts."""
+    selected_engine = [
+        c for c in all_changes
+        if c["tier"] in ("fix", "suggest") and (c["orig"], c["repl"]) in selected
+    ]
+    # apply_map drives both the markup and the SRT replacement; exact wins conflicts.
+    apply_map, tier_map = {}, {}
+    for c in selected_engine:
+        k = c["orig"].lower()
+        apply_map[k] = c["repl"]
+        tier_map[k] = c["tier"]
+    for k, v in replacements.items():
+        apply_map[k] = v
+        tier_map[k] = "exact"
+
+    apply_re = build_exact_regex(apply_map)
+    review_docx = build_marked_docx(romanized_text, apply_re, apply_map, tier_map)
+
+    rom_docx = romanize_srt.srt_text_to_docx_bytes(romanized_text)
+    srt_final, n_codes, n_fixes = build_srt(rom_docx, apply_map)
+
+    exp_bytes, n_new = build_dictionary_export(selected_engine)
+    return {
+        "review_docx": review_docx,
+        "srt_final": srt_final,
+        "n_codes": n_codes,
+        "n_fixes": n_fixes,
+        "engine_pairs": exp_bytes.getvalue(),
+        "n_new": n_new,
+        "n_engine_applied": len({(c["orig"], c["repl"]) for c in selected_engine}),
+    }
 
 
 def render_page(enable_engine):
@@ -433,12 +545,11 @@ def render_page(enable_engine):
                 srt_bytes, language, progress_cb=on_progress,
             )
             progress.progress(1.0, text="Romanization done!")
-            # A fresh romanization invalidates any earlier dictionary result.
+            # A fresh romanization invalidates any earlier scan/build.
             st.session_state["srt_result"] = {
                 "base": srt_file.name.rsplit(".srt", 1)[0],
                 "romanized_text": romanized_text,
                 "stats": stats,
-                "has_dict": False,
             }
         except Exception as e:
             log.exception("SRT romanization failed")
@@ -467,81 +578,97 @@ def render_page(enable_engine):
         use_container_width=True, key="dl_srt_romanized",
     )
 
-    # ── ② Upload dictionary → run ────────────────────────────────────────
+    # ── ② Upload dictionary → scan for corrections ───────────────────────
     st.divider()
     st.subheader("② Apply the dictionary")
     dict_file = st.file_uploader("Universal Dictionary (.docx)", type=["docx"], key="srt_dict")
 
-    if dict_file and st.button("🚀 Run", type="primary", use_container_width=True, key="run_dict"):
+    if dict_file and st.button("🔍 Find corrections", type="primary",
+                               use_container_width=True, key="run_dict"):
         try:
-            with st.spinner("Applying dictionary…"):
+            with st.spinner("Scanning for dictionary + engine corrections…"):
                 dict_bytes = dict_file.read()
-                # Reuse the existing fixer: wrap the romanized SRT in a docx and run it
-                # through the same dictionary + engine pipeline.
                 rom_docx = romanize_srt.srt_text_to_docx_bytes(res["romanized_text"])
-                output_bytes, replacements, all_changes = process_document(
+                # We only need the candidate list + the exact dictionary here; the
+                # outputs are built later from the user's ticked selection.
+                _doc, replacements, all_changes = process_document(
                     dict_bytes, rom_docx, enable_engine,
                 )
-                srt_final, n_codes, n_fixes = build_srt(rom_docx, replacements)
-                exp_bytes, n_new = build_dictionary_export(all_changes)
+            scan_id = st.session_state.get("_scan_seq", 0) + 1
+            st.session_state["_scan_seq"] = scan_id
             res.update({
-                "has_dict": True,
-                "n_pairs": len(replacements),
+                "replacements": replacements,
                 "all_changes": all_changes,
-                "review_docx": output_bytes.getvalue(),
-                "srt_final": srt_final,
-                "n_codes": n_codes,
-                "n_fixes": n_fixes,
-                "engine_pairs": exp_bytes.getvalue(),
-                "n_new": n_new,
+                "n_pairs": len(replacements),
+                "scan_id": scan_id,
+                "scanned": True,
             })
+            res.pop("built", None)   # a new scan invalidates any previously built files
             st.session_state["srt_result"] = res
         except Exception as e:
-            log.exception("Dictionary step failed")
+            log.exception("Dictionary scan failed")
             st.error(f"Something went wrong: {e}")
             st.exception(e)
 
     if not dict_file:
-        st.info("👆 Upload the Universal Dictionary (.docx), then click **Run**.")
+        st.info("👆 Upload the Universal Dictionary (.docx), then click **Find corrections**.")
 
-    if not res.get("has_dict"):
+    if not res.get("scanned"):
         return
 
-    # ── show dictionary results ──────────────────────────────────────────
+    # ── review: tick which engine suggestions to keep ────────────────────
     st.divider()
-    st.markdown("### 🔤 Dictionary corrections")
-    render_corrections_ui(res["n_pairs"], res["all_changes"])
+    st.markdown("### 🔤 Review corrections")
+    st.caption("Yellow dictionary fixes are always applied. Tick the engine "
+               "fixes/guesses you want — only ticked ones go into the files below.")
+    selected = render_selection(res["all_changes"], res["n_pairs"], res["scan_id"])
 
-    base = res["base"]
     st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("📦 Build files with the ticked corrections", type="primary",
+                 use_container_width=True, key="build_outputs"):
+        with st.spinner("Building files…"):
+            res["built"] = build_selected_outputs(
+                res["romanized_text"], res["replacements"], res["all_changes"], selected,
+            )
+        st.session_state["srt_result"] = res
+
+    built = res.get("built")
+    if not built:
+        st.info("Tick the corrections you want, then click **Build files** above. "
+                "(Re-build after changing any tick.)")
+        return
+
+    # ── ③ download the built files ───────────────────────────────────────
+    base = res["base"]
     d1, d2, d3 = st.columns(3)
     with d1:
         st.markdown("#### 🎞️ Final SRT")
         st.download_button(
-            f"⬇️ {base}_romanized_fixed.srt", data=res["srt_final"],
+            f"⬇️ {base}_romanized_fixed.srt", data=built["srt_final"],
             file_name=f"{base}_romanized_fixed.srt", mime="application/x-subrip",
             use_container_width=True, type="primary", key="dl_srt_final",
         )
-        st.caption(f"Romanized + {res['n_fixes']} confirmed dictionary fix(es), "
-                   f"{res['n_codes']} timecodes kept. No markup, no engine guesses.")
+        st.caption(f"Romanized + {built['n_fixes']} applied correction(s) "
+                   f"({built['n_engine_applied']} ticked engine), "
+                   f"{built['n_codes']} timecodes kept.")
     with d2:
         st.markdown("#### 📥 Review Word File")
         st.download_button(
-            f"⬇️ {base}_review.docx", data=res["review_docx"],
+            f"⬇️ {base}_review.docx", data=built["review_docx"],
             file_name=f"{base}_review.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True, key="dl_srt_review",
         )
-        st.caption("Romanized text with red/yellow/green/cyan markup to review.")
+        st.caption("Shows only the applied corrections (yellow + the ticked green/cyan).")
     with d3:
         st.markdown("#### 🔁 Grow the Dictionary")
         st.download_button(
-            f"⬇️ Engine-found pairs ({res['n_new']})",
-            data=res["engine_pairs"], file_name="engine_found_pairs.docx",
+            f"⬇️ Ticked engine pairs ({built['n_new']})",
+            data=built["engine_pairs"], file_name="engine_found_pairs.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True, disabled=(res["n_new"] == 0), key="dl_srt_pairs",
+            use_container_width=True, disabled=(built["n_new"] == 0), key="dl_srt_pairs",
         )
-        st.caption("Review, delete wrong rows, paste into the master dictionary.")
+        st.caption("Only the engine pairs you ticked. Paste into the master dictionary.")
 
 
 st.markdown("""

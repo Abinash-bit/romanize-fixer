@@ -66,7 +66,7 @@ def anthropic_available() -> bool:
 # On-disk cache  (same file + language  ->  no second API call)
 # ──────────────────────────────────────────────────────────────
 # Bumped when the prompt/parsing logic changes so old results aren't reused.
-_CACHE_VERSION = "v1"
+_CACHE_VERSION = "v2"
 # Override with ROMANIZE_CACHE_DIR to point at persistent storage (e.g. a mounted
 # volume). On Streamlit Community Cloud the default dir is ephemeral — it works
 # while the app is awake but is wiped on every reboot/redeploy.
@@ -201,8 +201,11 @@ SYSTEM_TEMPLATE = (
     "- Return one output line for every input line, in the same order.\n"
     "- Each output line MUST be: the same number, then a single TAB character "
     "(\\t), then the romanized text. Example:  12\\tmera dil kho gaya\n"
-    "- Use natural, widely-used phonetic romanization (the way these words are "
-    "commonly typed in Roman script in song lyrics and chat).\n"
+    "- Use natural, widely-used phonetic romanization (the common way these "
+    "words are written in Roman script).\n"
+    "- Use normal sentence capitalization: capitalize the first letter of each "
+    "sentence and proper nouns (names, places). Keep all other words lowercase. "
+    "Do NOT lowercase everything, and do NOT capitalize every word.\n"
     "- Convert native-script digits to Western digits (e.g. १९४७ -> 1947).\n"
     "- Keep punctuation, musical symbols (like ♪), and any text that is already "
     "in Roman letters unchanged.\n"
