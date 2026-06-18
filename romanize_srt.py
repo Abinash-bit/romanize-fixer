@@ -51,6 +51,14 @@ LANGUAGES = {
 INDEX_RE = re.compile(r'^\d+$')
 NUMBERED_RE = re.compile(r'^\s*(\d+)\t(.*)$')          # strict: "12\t<text>"
 LOOSE_RE = re.compile(r'^\s*(\d+)\s*[\t.):\-]\s?(.*)$')  # fallback: "12. <text>" etc.
+# closed-caption / sound cues like "[music playing]" — first letter inside [ ]
+_CC_RE = re.compile(r'(\[[^A-Za-z\]]*)([a-z])')
+
+
+def capitalize_closed_captions(text: str) -> str:
+    """Capitalize the first word inside any [ ... ] closed-caption / sound cue,
+    e.g. '[music playing]' -> '[Music playing]'. Idempotent (skips already-caps)."""
+    return _CC_RE.sub(lambda m: m.group(1) + m.group(2).upper(), text)
 
 
 def anthropic_available() -> bool:
@@ -302,7 +310,8 @@ def romanize_srt_bytes(data: bytes, language: str, progress_cb=None, api_key=Non
             stats = dict(hit.get("stats") or {})
             stats["cached"] = True
             log.info("Romanization cache HIT (%s…) — no API call", key[:8])
-            return hit["romanized_text"], stats
+            # apply on the cached text too, so older caches still get the fix
+            return capitalize_closed_captions(hit["romanized_text"]), stats
 
     import anthropic  # imported lazily so the rest of the app works without it
 
@@ -312,7 +321,7 @@ def romanize_srt_bytes(data: bytes, language: str, progress_cb=None, api_key=Non
     total = len(texts)
     if total == 0:
         stats = {"lines": 0, "blocks": len(blocks), "missing": 0, "cached": False}
-        text = serialize_srt(blocks)
+        text = capitalize_closed_captions(serialize_srt(blocks))
         if use_cache:
             _cache_store(key, text, stats)
         return text, stats
@@ -331,7 +340,7 @@ def romanize_srt_bytes(data: bytes, language: str, progress_cb=None, api_key=Non
     for (bi, lj), rom in zip(refs, romanized):
         blocks[bi].lines[lj] = rom
 
-    text = serialize_srt(blocks)
+    text = capitalize_closed_captions(serialize_srt(blocks))
     stats = {"lines": total, "blocks": len(blocks), "missing": missing, "cached": False}
     log.info("Romanized %d lines across %d blocks (%d kept original)",
              total, len(blocks), missing)
