@@ -332,6 +332,9 @@ def build_srt(input_bytes, replacements):
     doc = Document(io.BytesIO(input_bytes))
     lines = [fix_line(p.text) for p in doc.paragraphs]
     srt_text = "\n".join(lines).strip() + "\n"
+    # tidy whitespace: collapse runs of spaces between words, trim per-line edges
+    srt_text = re.sub(r'[ \t]{2,}', ' ', srt_text)
+    srt_text = re.sub(r'(?m)^[ \t]+|[ \t]+$', '', srt_text)
     n_codes = len(TIMECODE_RE.findall(srt_text))
     log.info("SRT built: %d timecodes, %d dictionary corrections applied", n_codes, n_fixes)
     return srt_text.encode("utf-8"), n_codes, n_fixes

@@ -61,6 +61,48 @@ def capitalize_closed_captions(text: str) -> str:
     return _CC_RE.sub(lambda m: m.group(1) + m.group(2).upper(), text)
 
 
+# song-lyric markers; lyric lines should start with a capital like a sentence
+_NOTE_CHARS = "♪♫♩♬🎵🎶"
+_NOTE_RE = re.compile("[" + _NOTE_CHARS + "]")
+_LINE_FIRST_LOWER_RE = re.compile(r'^([^A-Za-z]*)([a-z])')  # leading symbols then 1st letter
+
+
+def capitalize_music_lines(text: str) -> str:
+    """Capitalize the first word of every lyric line — a text line that contains a
+    musical note (e.g. '♪ mera dil ♪') or sits inside an open ♪...♪ region that
+    spans several lines. Timecode/index/blank lines are skipped. Idempotent."""
+    notes_seen = 0
+    out = []
+    for line in text.split("\n"):
+        s = line.strip()
+        is_text = bool(s) and "-->" not in line and not s.isdigit()
+        if is_text:
+            inside = notes_seen % 2 == 1          # odd note count => inside a ♪...♪
+            if inside or _NOTE_RE.search(line):
+                line = _LINE_FIRST_LOWER_RE.sub(
+                    lambda m: m.group(1) + m.group(2).upper(), line, count=1)
+            notes_seen += len(_NOTE_RE.findall(line))
+        out.append(line)
+    return "\n".join(out)
+
+
+# collapse runs of spaces/tabs; trim leading/trailing spaces on each line
+_MULTISPACE_RE = re.compile(r'[ \t]{2,}')
+_EDGE_SPACE_RE = re.compile(r'(?m)^[ \t]+|[ \t]+$')
+
+
+def _finalize_text(text: str) -> str:
+    """Tidy the romanized SRT before returning/caching: collapse extra spaces
+    between words, trim per-line edge spaces, capitalize closed captions, and
+    capitalize the first word of musical-note lyric lines. Newlines are never
+    touched, so the block/timecode structure is preserved."""
+    text = _MULTISPACE_RE.sub(' ', text)
+    text = _EDGE_SPACE_RE.sub('', text)
+    text = capitalize_closed_captions(text)
+    text = capitalize_music_lines(text)
+    return text
+
+
 def anthropic_available() -> bool:
     """True if the anthropic SDK is importable (used to show a friendly error)."""
     try:
@@ -311,7 +353,7 @@ def romanize_srt_bytes(data: bytes, language: str, progress_cb=None, api_key=Non
             stats["cached"] = True
             log.info("Romanization cache HIT (%s…) — no API call", key[:8])
             # apply on the cached text too, so older caches still get the fix
-            return capitalize_closed_captions(hit["romanized_text"]), stats
+            return _finalize_text(hit["romanized_text"]), stats
 
     import anthropic  # imported lazily so the rest of the app works without it
 
@@ -321,7 +363,7 @@ def romanize_srt_bytes(data: bytes, language: str, progress_cb=None, api_key=Non
     total = len(texts)
     if total == 0:
         stats = {"lines": 0, "blocks": len(blocks), "missing": 0, "cached": False}
-        text = capitalize_closed_captions(serialize_srt(blocks))
+        text = _finalize_text(serialize_srt(blocks))
         if use_cache:
             _cache_store(key, text, stats)
         return text, stats
@@ -340,7 +382,7 @@ def romanize_srt_bytes(data: bytes, language: str, progress_cb=None, api_key=Non
     for (bi, lj), rom in zip(refs, romanized):
         blocks[bi].lines[lj] = rom
 
-    text = capitalize_closed_captions(serialize_srt(blocks))
+    text = _finalize_text(serialize_srt(blocks))
     stats = {"lines": total, "blocks": len(blocks), "missing": missing, "cached": False}
     log.info("Romanized %d lines across %d blocks (%d kept original)",
              total, len(blocks), missing)
