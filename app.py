@@ -505,6 +505,37 @@ def build_selected_outputs(romanized_text, replacements, all_changes, selected):
     }
 
 
+def friendly_api_error(exc):
+    """Turn a raw Anthropic API exception into a short, actionable message — or
+    None if we can't classify it (caller falls back to the raw error). The biggest
+    one to catch is an out-of-credits key, which the API reports as a 400 with a
+    'credit balance is too low' message."""
+    status = getattr(exc, "status_code", None)
+    body = getattr(exc, "body", None)
+    text = str(exc).lower()
+    if isinstance(body, dict):
+        err = body.get("error")
+        text += " " + str((err or {}).get("message", "") if isinstance(err, dict) else err).lower()
+
+    if "credit balance" in text or "billing" in text or "purchase credits" in text:
+        return ("💳 Your Anthropic API key has run out of credits. Add credits at "
+                "console.anthropic.com → **Plan & Billing**, then try again. "
+                "(Nothing was charged and no file was changed.)")
+    if status == 401 or "authentication" in text or "invalid x-api-key" in text:
+        return ("🔑 The Anthropic API key is invalid or expired. Check the "
+                "`ANTHROPIC_API_KEY` in your `.env` / Streamlit Secrets.")
+    if status == 403 or "permission" in text:
+        return ("🚫 This API key isn't allowed to use this model. Check your "
+                "Anthropic workspace's model access.")
+    if status == 429 or "rate limit" in text:
+        return ("⏳ Hit Anthropic's rate limit. Wait a minute and try again, or "
+                "lower the request volume.")
+    if status == 529 or "overloaded" in text:
+        return ("🌐 Anthropic is overloaded right now (we already retried several "
+                "times). Please wait a bit and run it again.")
+    return None
+
+
 def render_page(enable_engine):
     """Single staged flow: romanize the SRT first, then apply the dictionary."""
     st.markdown(
@@ -557,8 +588,12 @@ def render_page(enable_engine):
         except Exception as e:
             log.exception("SRT romanization failed")
             st.session_state.pop("srt_result", None)
-            st.error(f"Something went wrong: {e}")
-            st.exception(e)
+            friendly = friendly_api_error(e)
+            if friendly:
+                st.error(friendly)
+            else:
+                st.error(f"Something went wrong: {e}")
+                st.exception(e)
 
     if not srt_file:
         st.info("👆 Upload a native-script `.srt` and choose its language.")
@@ -703,6 +738,20 @@ if st.sidebar.button("🧹 Clear romanization cache"):
     n = romanize_srt.clear_cache()
     st.session_state.pop("srt_result", None)
     st.sidebar.success(f"Cleared {n} cached romanization(s).")
+
+st.sidebar.divider()
+if romanize_srt.tracing_enabled():
+    project = os.getenv("LANGSMITH_PROJECT") or "default"
+    st.sidebar.caption(
+        f"📊 **LangSmith tracing ON** → project `{project}`. Each romanized file is "
+        "one trace; token usage & cost show up at smith.langchain.com. "
+        "(Cached files make no API call, so they cost nothing.)"
+    )
+else:
+    st.sidebar.caption(
+        "📊 LangSmith tracing is OFF. Set `LANGSMITH_TRACING=true` (and "
+        "`LANGSMITH_API_KEY`) in your `.env` / Secrets to track cost & traces."
+    )
 
 render_page(enable_engine)
 

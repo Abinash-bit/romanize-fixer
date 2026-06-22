@@ -143,6 +143,68 @@ def anthropic_available() -> bool:
 
 
 # ──────────────────────────────────────────────────────────────
+# LangSmith tracing + cost tracking  (optional; off unless enabled)
+# ──────────────────────────────────────────────────────────────
+# We call the Anthropic SDK directly (no LangChain), so to see traces + $ cost in
+# LangSmith we (1) wrap the client with langsmith.wrappers.wrap_anthropic — it logs
+# every messages.stream() call with its token usage, which LangSmith turns into a
+# cost — and (2) decorate romanize_srt_bytes with @traceable so all the per-batch
+# calls for ONE file are grouped under a single trace (one trace == one file).
+#
+# Everything here is a no-op unless the `langsmith` package is installed AND
+# LANGSMITH_TRACING is truthy. LangSmith reads the rest of its config itself from
+# the LANGSMITH_API_KEY / LANGSMITH_ENDPOINT / LANGSMITH_PROJECT env vars (loaded
+# from .env by app.py's load_dotenv()).
+try:
+    from langsmith import traceable as _traceable
+except Exception:  # langsmith not installed — make @_traceable(...) a passthrough
+    def _traceable(*d_args, **d_kwargs):
+        if len(d_args) == 1 and callable(d_args[0]) and not d_kwargs:
+            return d_args[0]            # used bare:  @_traceable
+        return lambda fn: fn            # used with args:  @_traceable(...)
+
+
+def tracing_enabled() -> bool:
+    """True if LangSmith tracing is switched on via the LANGSMITH_TRACING env var."""
+    return os.getenv("LANGSMITH_TRACING", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _make_client(api_key=None):
+    """Create the Anthropic client, transparently wrapped for LangSmith tracing +
+    cost tracking when tracing is enabled and langsmith is installed. Returns a
+    plain client otherwise (or if wrapping fails for any reason)."""
+    import anthropic
+    client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
+    if tracing_enabled():
+        try:
+            from langsmith.wrappers import wrap_anthropic
+            client = wrap_anthropic(client)
+            log.info("LangSmith tracing enabled (project=%s)",
+                     os.getenv("LANGSMITH_PROJECT") or "default")
+        except Exception as e:
+            log.warning("LANGSMITH_TRACING is on but tracing couldn't start: %s", e)
+    return client
+
+
+def _trace_inputs(inputs: dict) -> dict:
+    """What romanize_srt_bytes logs as a trace's inputs — deliberately NOT the raw
+    file bytes and NEVER the api_key, just enough to identify the run."""
+    return {
+        "language": inputs.get("language"),
+        "source_bytes": len(inputs.get("data") or b""),
+        "use_cache": inputs.get("use_cache", True),
+    }
+
+
+def _trace_outputs(out) -> dict:
+    try:
+        _text, stats = out
+        return {"stats": stats}
+    except Exception:
+        return {}
+
+
+# ──────────────────────────────────────────────────────────────
 # On-disk cache  (same file + language  ->  no second API call)
 # ──────────────────────────────────────────────────────────────
 # Bumped when the prompt/parsing logic changes so old results aren't reused.
@@ -397,6 +459,8 @@ def _romanize_batch(client, batch, language_desc):
     return out, n_missing
 
 
+@_traceable(run_type="chain", name="romanize_srt",
+            process_inputs=_trace_inputs, process_outputs=_trace_outputs)
 def romanize_srt_bytes(data: bytes, language: str, progress_cb=None, api_key=None,
                        use_cache: bool = True):
     """Romanize a native-script .srt.
@@ -417,8 +481,8 @@ def romanize_srt_bytes(data: bytes, language: str, progress_cb=None, api_key=Non
             # apply on the cached text too, so older caches still get the fix
             return _finalize_text(hit["romanized_text"]), stats
 
-    import anthropic  # imported lazily so the rest of the app works without it
-
+    # the Anthropic SDK is imported lazily inside _make_client (called below), so
+    # the cache-hit path above works even if anthropic isn't installed.
     language_desc = LANGUAGES.get(language, language)
     blocks = parse_srt(decode_srt(data))
     refs, texts = _collect(blocks)
@@ -430,7 +494,7 @@ def romanize_srt_bytes(data: bytes, language: str, progress_cb=None, api_key=Non
             _cache_store(key, text, stats)
         return text, stats
 
-    client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
+    client = _make_client(api_key)
 
     romanized, missing = [], 0
     for start in range(0, total, BATCH_SIZE):
