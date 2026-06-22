@@ -90,14 +90,42 @@ def capitalize_music_lines(text: str) -> str:
 _MULTISPACE_RE = re.compile(r'[ \t]{2,}')
 _EDGE_SPACE_RE = re.compile(r'(?m)^[ \t]+|[ \t]+$')
 
+# first letter of a line, after any leading symbols/spaces
+_LINE_START_RE = re.compile(r'^([^A-Za-z]*)([A-Za-z])')
+# a line that closes a unit -> the next line begins a new sentence
+_UNIT_END_CHARS = ".!?…♪♫♩♬]"
+
+
+def _sentence_case_line_starts(text: str) -> str:
+    """Capitalize a line's first letter ONLY when it starts a NEW sentence (the
+    previous text line ended with . ! ? or a music/CC boundary). A line that just
+    continues the previous sentence is lowercased — so line breaks no longer all
+    start with a capital. CC/lyric lines are re-capitalized by their own passes
+    afterwards, so this never undoes those."""
+    new_sentence = True
+    out = []
+    for line in text.split("\n"):
+        s = line.strip()
+        is_text = bool(s) and "-->" not in line and not s.isdigit()
+        if is_text:
+            cap = new_sentence
+            line = _LINE_START_RE.sub(
+                lambda m: m.group(1) + (m.group(2).upper() if cap else m.group(2).lower()),
+                line, count=1)
+            new_sentence = s[-1] in _UNIT_END_CHARS
+        out.append(line)
+    return "\n".join(out)
+
 
 def _finalize_text(text: str) -> str:
     """Tidy the romanized SRT before returning/caching: collapse extra spaces
-    between words, trim per-line edge spaces, capitalize closed captions, and
-    capitalize the first word of musical-note lyric lines. Newlines are never
-    touched, so the block/timecode structure is preserved."""
+    between words, trim per-line edge spaces, fix sentence-start capitalization
+    (only after . ! ? — not every line break), then re-capitalize closed captions
+    and musical-note lyric lines. Newlines are never touched, so the block/timecode
+    structure is preserved."""
     text = _MULTISPACE_RE.sub(' ', text)
     text = _EDGE_SPACE_RE.sub('', text)
+    text = _sentence_case_line_starts(text)
     text = capitalize_closed_captions(text)
     text = capitalize_music_lines(text)
     return text
