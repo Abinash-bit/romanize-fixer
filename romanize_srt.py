@@ -26,6 +26,8 @@ import io
 import os
 import re
 import json
+import time
+import random
 import hashlib
 import logging
 
@@ -296,6 +298,25 @@ SYSTEM_TEMPLATE = (
 # effort is an optimisation; drop it automatically on an SDK that doesn't know it
 _EXTRA = {"output_config": {"effort": "low"}}
 
+# Anthropic occasionally returns "Overloaded" (HTTP 529) or rate-limits (429).
+# These can arrive mid-stream, where the SDK does NOT auto-retry, so _romanize_batch
+# retries with exponential backoff — but only on transient errors, never on a 4xx
+# like bad-request or auth (retrying those is pointless).
+_RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504, 529}
+_MAX_ATTEMPTS = 6            # initial try + 5 retries (~1.5+3+6+12+24s max backoff)
+_BASE_RETRY_DELAY = 1.5      # seconds, doubled each retry
+
+
+def _is_retryable(exc) -> bool:
+    """True for transient Anthropic errors worth retrying (overloaded, rate limit,
+    5xx, connection/timeout); False for client errors (bad request, auth, etc.)."""
+    import anthropic
+    if isinstance(exc, (anthropic.APIConnectionError, anthropic.APITimeoutError)):
+        return True
+    if getattr(exc, "status_code", None) in _RETRYABLE_STATUS:
+        return True
+    return "overloaded" in str(exc).lower()
+
 
 def _parse_numbered(output: str, n: int):
     """Map the model's reply back to n lines. Prefers the explicit 'N\\t...' form;
@@ -340,15 +361,28 @@ def _romanize_batch(client, batch, language_desc):
         messages=[{"role": "user", "content": numbered}],
     )
     # stream (avoids HTTP timeouts on large batches); .get_final_message() gives
-    # the assembled reply without hand-handling events.
-    try:
-        with client.messages.stream(**kwargs, **_EXTRA) as stream:
-            msg = stream.get_final_message()
-    except TypeError:
-        # installed SDK predates output_config/effort — retry without it
-        _EXTRA = {}
-        with client.messages.stream(**kwargs) as stream:
-            msg = stream.get_final_message()
+    # the assembled reply without hand-handling events. Anthropic can return an
+    # "Overloaded" (529) or rate-limit (429) error — sometimes mid-stream, where the
+    # SDK won't auto-retry — so we retry the whole batch with exponential backoff.
+    attempt = 0
+    while True:
+        try:
+            with client.messages.stream(**kwargs, **_EXTRA) as stream:
+                msg = stream.get_final_message()
+            break
+        except TypeError:
+            if _EXTRA:            # SDK predates output_config/effort — drop it, retry now
+                _EXTRA = {}
+                continue
+            raise                 # a genuine TypeError, not the effort kwarg
+        except Exception as exc:
+            attempt += 1
+            if attempt >= _MAX_ATTEMPTS or not _is_retryable(exc):
+                raise
+            delay = _BASE_RETRY_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 0.75)
+            log.warning("Anthropic transient error (%s); retry %d/%d in %.1fs: %s",
+                        type(exc).__name__, attempt, _MAX_ATTEMPTS - 1, delay, exc)
+            time.sleep(delay)
 
     text = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text")
     parsed = _parse_numbered(text, len(batch))
