@@ -42,6 +42,7 @@ BATCH_SIZE = 40          # lines per API call — small enough to keep 1:1 align
 # label shown in the dropdown -> script hint handed to the model
 LANGUAGES = {
     "Hindi":    "Hindi, written in the Devanagari script",
+    "Bengali":  "Bengali, written in the Bengali (Bangla) script",
     "Punjabi":  "Punjabi, written in the Gurmukhi script",
     "Marathi":  "Marathi, written in the Devanagari script",
     "Tamil":    "Tamil, written in the Tamil script",
