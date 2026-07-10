@@ -54,23 +54,41 @@ def _clean_note(s: str) -> str:
     return s.strip()
 
 
+_DEVANAGARI_RE = re.compile(r'[ऀ-ॿ]')
+
+
 def load_dictionary(file_bytes: bytes):
-    """Return (exact_replacements, pairs).
+    """Return (exact_replacements, pairs, hindi_map).
 
     exact_replacements: {variant_lower: planetread_word}  (verbatim, as before)
     pairs:              [(wrong, right), ...]  cleaned, for the learning engine
+    hindi_map:          {hindi_word: planetread_english_word} from the
+                        dictionary's 4th (Hindi) column — used to write the
+                        PlanetRead Roman-letter word straight into the source
+                        SRT *before* romanization. Empty for 3-column files.
     """
     t0 = time.perf_counter()
     log.info("Loading dictionary (%d KB)…", len(file_bytes) // 1024)
     doc = Document(io.BytesIO(file_bytes))
     replacements = {}
     pairs = []
+    hindi_map = {}
     for table in doc.tables:
         for row in table.rows:
             cells = [c.text.strip() for c in row.cells]
             if len(cells) < 3:
                 continue
             ai_word, pr_word = cells[1].strip(), cells[2].strip()
+            # The Hindi column only needs a PlanetRead word next to it — rows
+            # with an empty AI Version still count for the pre-replacement map.
+            hindi = cells[3].strip() if len(cells) > 3 else ""
+            if pr_word and hindi:
+                pr_clean = _clean_note(pr_word)
+                if pr_clean:
+                    for hv in hindi.split('/'):
+                        hv = _clean_note(hv.strip())
+                        if hv and _DEVANAGARI_RE.search(hv):
+                            hindi_map[hv] = pr_clean
             if not ai_word or not pr_word:
                 continue
             if ai_word.lower() in ("ai version", "ai_version"):
@@ -82,9 +100,9 @@ def load_dictionary(file_bytes: bytes):
             a, b = _clean_note(ai_word), _clean_note(pr_word)
             if a and b:
                 pairs.append((a, b))
-    log.info("Dictionary loaded: %d exact variants, %d clean pairs in %.2fs",
-             len(replacements), len(pairs), time.perf_counter() - t0)
-    return replacements, pairs
+    log.info("Dictionary loaded: %d exact variants, %d clean pairs, %d hindi words in %.2fs",
+             len(replacements), len(pairs), len(hindi_map), time.perf_counter() - t0)
+    return replacements, pairs, hindi_map
 
 
 # ─────────────────────────────────────────────
@@ -155,8 +173,14 @@ def build_exact_regex(replacements):
     return re.compile(r'(?<![A-Za-z])(' + alt + r')(?![A-Za-z])', re.IGNORECASE)
 
 
-def replace_in_paragraph(para, exact_re, replacements, engine, enable_engine):
-    """Return list of change dicts: {orig, repl, tier, conf, reason}."""
+def replace_in_paragraph(para, exact_re, replacements, engine, enable_engine,
+                         protected=frozenset()):
+    """Return list of change dicts: {orig, repl, tier, conf, reason}.
+
+    `protected` holds lowercase words that were pre-substituted from the
+    dictionary's Hindi column — they are already the confirmed PlanetRead
+    spelling, so neither the exact dictionary nor the engine may touch them.
+    """
     full_text = "".join(run.text for run in para.runs)
     if not full_text.strip():
         return []
@@ -165,6 +189,8 @@ def replace_in_paragraph(para, exact_re, replacements, engine, enable_engine):
     spans = []  # (start, end, replacement, tier, conf, reason)
     if exact_re is not None:
         for m in exact_re.finditer(full_text):
+            if m.group(1).lower() in protected:
+                continue
             rep = replacements.get(m.group(1).lower())
             if rep is not None:
                 spans.append((m.start(), m.end(), rep, "exact", 1.0, "dictionary"))
@@ -173,6 +199,8 @@ def replace_in_paragraph(para, exact_re, replacements, engine, enable_engine):
     if enable_engine and engine is not None:
         for m in re.finditer(r'[A-Za-z]+', full_text):
             if any(s < m.end() and m.start() < e for s, e, *_ in spans):
+                continue
+            if m.group(0).lower() in protected:
                 continue
             sug = engine.suggest(m.group(0))
             if sug is None or sug.confidence < SUGGEST_FLOOR:
@@ -209,8 +237,10 @@ def replace_in_paragraph(para, exact_re, replacements, engine, enable_engine):
     return changes
 
 
-def process_document(dict_bytes, input_bytes, enable_engine, progress_cb=None):
-    """progress_cb(done, total, stage_msg) is called as work proceeds (optional)."""
+def process_document(dict_bytes, input_bytes, enable_engine, progress_cb=None,
+                     protected=frozenset()):
+    """progress_cb(done, total, stage_msg) is called as work proceeds (optional).
+    `protected`: lowercase pre-substituted words that must not be changed."""
     t_start = time.perf_counter()
 
     def report(done, total, msg):
@@ -218,7 +248,7 @@ def process_document(dict_bytes, input_bytes, enable_engine, progress_cb=None):
             progress_cb(done, total, msg)
 
     report(0, 1, "Reading dictionary…")
-    replacements, pairs = load_dictionary(dict_bytes)
+    replacements, pairs, _hindi_map = load_dictionary(dict_bytes)
     exact_re = build_exact_regex(replacements)
 
     report(0, 1, "Training pattern engine…")
@@ -239,7 +269,8 @@ def process_document(dict_bytes, input_bytes, enable_engine, progress_cb=None):
     all_changes = []
     t_scan = time.perf_counter()
     for i, para in enumerate(paras, 1):
-        all_changes.extend(replace_in_paragraph(para, exact_re, replacements, engine, enable_engine))
+        all_changes.extend(replace_in_paragraph(para, exact_re, replacements, engine,
+                                                enable_engine, protected))
         if i % 200 == 0 or i == total:
             log.info("  …%d/%d paragraphs, %d changes so far", i, total, len(all_changes))
             report(i, total, f"Scanning paragraphs… {i}/{total}")
@@ -302,12 +333,13 @@ def _match_case(matched, replacement):
     return rep
 
 
-def build_srt(input_bytes, replacements):
+def build_srt(input_bytes, replacements, protected=frozenset()):
     """Build a clean .srt from the subtitle Word file.
 
     - applies ONLY the confirmed dictionary (yellow) corrections — wrong word is
       replaced by the correct word, with NO red/green/cyan markup at all
     - engine guesses are NOT applied (original word kept) — they're unconfirmed
+    - words in `protected` (pre-substituted from the Hindi column) are kept as-is
     - timecodes / block numbers already present in the Word text are preserved
 
     Returns (srt_bytes, num_timecodes, num_corrections).
@@ -322,6 +354,8 @@ def build_srt(input_bytes, replacements):
 
         def repl(m):
             nonlocal n_fixes
+            if m.group(1).lower() in protected:
+                return m.group(0)
             rep = replacements.get(m.group(1).lower())
             if rep is None:
                 return m.group(0)
@@ -436,9 +470,10 @@ def render_selection(all_changes, n_pairs, scan_id):
     return sel
 
 
-def build_marked_docx(text, apply_re, apply_map, tier_map):
+def build_marked_docx(text, apply_re, apply_map, tier_map, protected=frozenset()):
     """Word review file: each applied correction shown as red original + a
-    tier-coloured highlight of the replacement. Only keys in apply_map are marked."""
+    tier-coloured highlight of the replacement. Only keys in apply_map are marked;
+    `protected` words (pre-substituted from the Hindi column) are never marked."""
     doc = Document()
     for line in text.split("\n"):
         para = doc.add_paragraph()
@@ -448,6 +483,8 @@ def build_marked_docx(text, apply_re, apply_map, tier_map):
         if apply_re is not None:
             for m in apply_re.finditer(line):
                 key = m.group(1).lower()
+                if key in protected:
+                    continue
                 rep = apply_map.get(key)
                 if rep is not None:
                     rep = _match_case(m.group(1), rep)
@@ -470,9 +507,11 @@ def build_marked_docx(text, apply_re, apply_map, tier_map):
     return buf.getvalue()
 
 
-def build_selected_outputs(romanized_text, replacements, all_changes, selected):
+def build_selected_outputs(romanized_text, replacements, all_changes, selected,
+                           protected=frozenset()):
     """Apply the exact dictionary + only the ticked engine pairs. Returns a dict
-    with the review docx, final SRT, engine-pairs export, and counts."""
+    with the review docx, final SRT, engine-pairs export, and counts.
+    `protected` words (pre-substituted from the Hindi column) are left as-is."""
     selected_engine = [
         c for c in all_changes
         if c["tier"] in ("fix", "suggest") and (c["orig"], c["repl"]) in selected
@@ -488,10 +527,10 @@ def build_selected_outputs(romanized_text, replacements, all_changes, selected):
         tier_map[k] = "exact"
 
     apply_re = build_exact_regex(apply_map)
-    review_docx = build_marked_docx(romanized_text, apply_re, apply_map, tier_map)
+    review_docx = build_marked_docx(romanized_text, apply_re, apply_map, tier_map, protected)
 
     rom_docx = romanize_srt.srt_text_to_docx_bytes(romanized_text)
-    srt_final, n_codes, n_fixes = build_srt(rom_docx, apply_map)
+    srt_final, n_codes, n_fixes = build_srt(rom_docx, apply_map, protected)
 
     exp_bytes, n_new = build_dictionary_export(selected_engine)
     return {
@@ -552,13 +591,18 @@ def render_page(enable_engine):
         st.warning("⚠️ No `ANTHROPIC_API_KEY` found. Add it to a `.env` file (local) or "
                    "to **Secrets** (Streamlit Cloud), e.g. `ANTHROPIC_API_KEY = sk-ant-...`.")
 
-    # ── ① Upload subtitle + pick language → romanize ─────────────────────
+    # ── ① Upload subtitle + dictionary + pick language → romanize ────────
     st.subheader("① Upload subtitle & romanize")
-    c1, c2 = st.columns([3, 2])
+    c1, c2, c3 = st.columns([3, 3, 2])
     with c1:
         srt_file = st.file_uploader("Native-script subtitle (.srt)", type=["srt"], key="srt_input")
     with c2:
+        dict_file = st.file_uploader("Universal Dictionary (.docx)", type=["docx"], key="srt_dict")
+    with c3:
         language = st.selectbox("Source language", list(romanize_srt.LANGUAGES.keys()), key="srt_lang")
+    st.caption("If the dictionary has the **Hindi word** column, those words are replaced "
+               "with their PlanetRead English spelling *before* the AI call — and locked, "
+               "so no later correction can change them.")
 
     can_romanize = bool(srt_file) and has_key and romanize_srt.anthropic_available()
     if srt_file and st.button("🌐 Romanize SRT", type="primary",
@@ -574,7 +618,16 @@ def render_page(enable_engine):
             status.caption(f"⏱️ {time.perf_counter() - t_ui:.1f}s")
 
         try:
-            srt_bytes = srt_file.read()
+            srt_bytes = srt_file.getvalue()
+            # Pre-pass: dictionary Hindi column -> PlanetRead English, in place.
+            protected, n_pre = set(), 0
+            if dict_file is not None:
+                _, _, hindi_map = load_dictionary(dict_file.getvalue())
+                if hindi_map:
+                    src_text = romanize_srt.decode_srt(srt_bytes)
+                    src_text, protected, n_pre = romanize_srt.pre_substitute_hindi(
+                        src_text, hindi_map)
+                    srt_bytes = src_text.encode("utf-8")
             romanized_text, stats = romanize_srt.romanize_srt_bytes(
                 srt_bytes, language, progress_cb=on_progress,
             )
@@ -584,6 +637,8 @@ def render_page(enable_engine):
                 "base": srt_file.name.rsplit(".srt", 1)[0],
                 "romanized_text": romanized_text,
                 "stats": stats,
+                "protected": protected,
+                "n_pre": n_pre,
             }
         except Exception as e:
             log.exception("SRT romanization failed")
@@ -605,6 +660,9 @@ def render_page(enable_engine):
     # ── show romanized output ────────────────────────────────────────────
     stats = res["stats"]
     msg = f"✅ Romanized {stats['lines']} line(s) across {stats['blocks']} block(s)."
+    if res.get("n_pre"):
+        msg += (f" 🔒 {res['n_pre']} Hindi word occurrence(s) pre-replaced from the "
+                f"dictionary ({len(res.get('protected') or set())} unique words, protected).")
     if stats.get("missing"):
         msg += f" ⚠️ {stats['missing']} line(s) kept as-is (model didn't return them)."
     if stats.get("cached"):
@@ -616,21 +674,22 @@ def render_page(enable_engine):
         use_container_width=True, key="dl_srt_romanized",
     )
 
-    # ── ② Upload dictionary → scan for corrections ───────────────────────
+    # ── ② Apply the dictionary (uploaded in step ①) ──────────────────────
     st.divider()
     st.subheader("② Apply the dictionary")
-    dict_file = st.file_uploader("Universal Dictionary (.docx)", type=["docx"], key="srt_dict")
 
     if dict_file and st.button("🔍 Find corrections", type="primary",
                                use_container_width=True, key="run_dict"):
         try:
             with st.spinner("Scanning for dictionary + engine corrections…"):
-                dict_bytes = dict_file.read()
+                dict_bytes = dict_file.getvalue()
                 rom_docx = romanize_srt.srt_text_to_docx_bytes(res["romanized_text"])
                 # We only need the candidate list + the exact dictionary here; the
                 # outputs are built later from the user's ticked selection.
+                # Pre-substituted (protected) words are skipped entirely.
                 _doc, replacements, all_changes = process_document(
                     dict_bytes, rom_docx, enable_engine,
+                    protected=res.get("protected") or frozenset(),
                 )
             scan_id = st.session_state.get("_scan_seq", 0) + 1
             st.session_state["_scan_seq"] = scan_id
@@ -649,7 +708,7 @@ def render_page(enable_engine):
             st.exception(e)
 
     if not dict_file:
-        st.info("👆 Upload the Universal Dictionary (.docx), then click **Find corrections**.")
+        st.info("👆 Upload the Universal Dictionary (.docx) in step ①, then click **Find corrections**.")
 
     if not res.get("scanned"):
         return
@@ -667,6 +726,7 @@ def render_page(enable_engine):
         with st.spinner("Building files…"):
             res["built"] = build_selected_outputs(
                 res["romanized_text"], res["replacements"], res["all_changes"], selected,
+                protected=res.get("protected") or frozenset(),
             )
         st.session_state["srt_result"] = res
 

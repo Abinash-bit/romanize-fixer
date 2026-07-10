@@ -331,6 +331,57 @@ def _collect(blocks):
 
 
 # ──────────────────────────────────────────────────────────────
+# Hindi pre-substitution (dictionary 4th column)
+# ──────────────────────────────────────────────────────────────
+# The universal dictionary's Hindi column pairs a native-script word with its
+# PlanetRead Roman-letter spelling. Before the SRT goes to the model, every such
+# Hindi word is replaced in place by that PlanetRead word. The model's prompt
+# keeps already-Roman text unchanged, so these words pass through romanization
+# untouched — and the returned `protected` set lets the later dictionary pass
+# skip them, so a confirmed pre-replacement is never "corrected" a second time
+# (the dictionary contains conflicting pairs like nikal→nikaal AND nikaal→nikal;
+# only the Hindi source word disambiguates which one is right).
+_DEVANAGARI_CHAR = r'ऀ-ॿ'
+
+
+def pre_substitute_hindi(srt_text: str, hindi_map: dict):
+    """Replace dictionary Hindi words with their PlanetRead Roman versions.
+
+    Returns (new_text, protected_words, n_replaced) where protected_words is a
+    set of lowercase Roman words that were written in and must not be altered
+    by any later correction pass. Timecode and index lines are never touched.
+    """
+    if not hindi_map:
+        return srt_text, set(), 0
+    keys = sorted(hindi_map.keys(), key=len, reverse=True)   # longest first
+    pattern = re.compile(
+        rf'(?<![{_DEVANAGARI_CHAR}])(' +
+        '|'.join(re.escape(k) for k in keys) +
+        rf')(?![{_DEVANAGARI_CHAR}])'
+    )
+    protected: set = set()
+    count = 0
+
+    def repl(m):
+        nonlocal count
+        rep = hindi_map[m.group(1)]
+        protected.add(rep.lower())
+        count += 1
+        return rep
+
+    out = []
+    for line in srt_text.split('\n'):
+        s = line.strip()
+        if '-->' in line or INDEX_RE.match(s) or not s:
+            out.append(line)
+        else:
+            out.append(pattern.sub(repl, line))
+    log.info("Pre-substitution: %d Hindi word occurrence(s) replaced, %d unique protected word(s)",
+             count, len(protected))
+    return '\n'.join(out), protected, count
+
+
+# ──────────────────────────────────────────────────────────────
 # Anthropic transliteration
 # ──────────────────────────────────────────────────────────────
 SYSTEM_TEMPLATE = (
