@@ -56,6 +56,30 @@ def _clean_note(s: str) -> str:
 
 _DEVANAGARI_RE = re.compile(r'[ऀ-ॿ]')
 
+# ── Temporary stitch (bucket A) ───────────────────────────────────────────────
+# These Hindi words have CONTRADICTORY rows in the dictionary — two different
+# PlanetRead spellings for the same word — so the output otherwise depends on
+# which row happens to come last. We pin ONE spelling here; whenever the word
+# appears in the source it is pre-substituted to this exact form and locked, so
+# no later (and possibly conflicting) rule can change it.
+#
+# Picks follow PlanetRead's long-vowel convention (आ→aa, ऊ→oo, ई→ee) and should
+# be confirmed by the language expert — just edit the value to re-pin a word.
+HINDI_FORCE = {
+    "निकाल": "nikaal",          # vs निकल -> nikal (kept distinct)
+    "राज्य": "raajya",
+    "माँ": "maa",
+    "ऊपर": "oopar",
+    "हमारे": "hamaare",
+    "आवाज़": "Aawaaz",
+    "भलाई": "bhalaai",
+    "महत्वपूर्ण": "mahatvapoorn",
+    "कर्तव्य": "kartavya",
+    "महज़": "mehaz",
+    "बजाऊँ": "bajaoon",
+    "शासन": "shaasan",
+}
+
 
 def load_dictionary(file_bytes: bytes):
     """Return (exact_replacements, pairs, hindi_map).
@@ -100,8 +124,13 @@ def load_dictionary(file_bytes: bytes):
             a, b = _clean_note(ai_word), _clean_note(pr_word)
             if a and b:
                 pairs.append((a, b))
-    log.info("Dictionary loaded: %d exact variants, %d clean pairs, %d hindi words in %.2fs",
-             len(replacements), len(pairs), len(hindi_map), time.perf_counter() - t0)
+    # Pin the contradictory (bucket A) words to one spelling, overriding whatever
+    # the dictionary's row order produced.
+    hindi_map.update(HINDI_FORCE)
+    log.info("Dictionary loaded: %d exact variants, %d clean pairs, %d hindi words "
+             "(%d force-pinned) in %.2fs",
+             len(replacements), len(pairs), len(hindi_map), len(HINDI_FORCE),
+             time.perf_counter() - t0)
     return replacements, pairs, hindi_map
 
 
